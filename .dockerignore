@@ -1,0 +1,12 @@
+.git
+.claude
+**/.venv
+**/node_modules
+frontend/dist
+**/__pycache__
+**/*.pyc
+**/*.pyo
+*.md
+install.bat
+start.bat
+start_dev.bat
