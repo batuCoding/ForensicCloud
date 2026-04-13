@@ -16,3 +16,11 @@ MAX_PREVIEW_POINTS = 2_000_000
 PREVIEW_VOXEL_SIZE = 0.02
 
 APP_VERSION = "1.0.0"
+
+# Server binding — override via env vars for Docker / remote deployments
+HOST = os.getenv("HOST", "127.0.0.1")
+try:
+    PORT = int(os.getenv("PORT", "8000"))
+except ValueError:
+    PORT = 8000
+OPEN_BROWSER = os.getenv("OPEN_BROWSER", "1") not in ("0", "false", "no")

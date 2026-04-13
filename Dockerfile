@@ -14,6 +14,7 @@ FROM python:3.11-slim-bookworm
 
 # System libraries needed by pye57 (OpenMP), Pillow (JPEG/OpenJPEG), and scipy
 RUN apt-get update && apt-get install -y --no-install-recommends \
+        curl \
         libgomp1 \
         libjpeg62-turbo \
         libopenjp2-7 \
@@ -25,7 +26,7 @@ WORKDIR /app
 # cupy is intentionally excluded here — entrypoint.sh installs it at runtime
 # only when an NVIDIA GPU is present, keeping the image small for CPU-only use.
 COPY backend/requirements.txt ./
-RUN grep -v '^\s*#' requirements.txt | grep -v 'cupy' | pip install --no-cache-dir -r /dev/stdin
+RUN grep -vE '^\s*(#|$)' requirements.txt | grep -v 'cupy' | pip install --no-cache-dir -r /dev/stdin
 
 # Backend source
 COPY backend/ ./backend/

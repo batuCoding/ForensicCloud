@@ -2,7 +2,6 @@
 ForensicCloud — main FastAPI application.
 Serves the React frontend as static files and mounts the API routers.
 """
-import os
 import webbrowser
 import threading
 from pathlib import Path
@@ -12,7 +11,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
-from config import FRONTEND_DIST, APP_VERSION
+from config import FRONTEND_DIST, APP_VERSION, HOST, PORT, OPEN_BROWSER
 from routers import upload, process, export, audit
 
 app = FastAPI(
@@ -72,16 +71,13 @@ def _open_browser():
 
 
 if __name__ == "__main__":
-    host = os.getenv("HOST", "127.0.0.1")
-    port = int(os.getenv("PORT", "8000"))
-
     print("=" * 60)
     print("  ForensicCloud — Forensic Point Cloud Cleaning Platform")
     print(f"  Version {APP_VERSION}")
-    print(f"  Listening on http://{host}:{port}")
+    print(f"  Listening on http://{HOST}:{PORT}")
     print("=" * 60)
 
-    if os.getenv("OPEN_BROWSER", "1") != "0":
+    if OPEN_BROWSER:
         threading.Thread(target=_open_browser, daemon=True).start()
 
-    uvicorn.run("main:app", host=host, port=port, reload=False, log_level="warning")
+    uvicorn.run("main:app", host=HOST, port=PORT, reload=False, log_level="warning")
