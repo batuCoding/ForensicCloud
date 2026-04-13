@@ -43,6 +43,22 @@ def health():
     return {"status": "ok", "version": APP_VERSION}
 
 
+@app.get("/api/gpu-info")
+def gpu_info():
+    from services.gpu_utils import GPU_INFO, GPU_AVAILABLE, SKLEARN_AVAILABLE, CPU_COUNT
+    return {
+        "gpu": GPU_INFO,
+        "cpu_count": CPU_COUNT,
+        "sklearn_available": SKLEARN_AVAILABLE,
+        "acceleration": {
+            "ransac":       "gpu_batched"    if GPU_AVAILABLE else ("cpu_parallel" if CPU_COUNT > 1 else "cpu_serial"),
+            "sor_ror":      "gpu_brute_knn"  if GPU_AVAILABLE else ("sklearn_parallel" if SKLEARN_AVAILABLE else "scipy_kdtree"),
+            "voxel":        "gpu_lexsort"    if GPU_AVAILABLE else "numpy_unique",
+            "color_filter": "gpu_vectorized" if GPU_AVAILABLE else "numpy_vectorized",
+        },
+    }
+
+
 # Serve built React app (production mode)
 if FRONTEND_DIST.exists():
     app.mount("/", StaticFiles(directory=str(FRONTEND_DIST), html=True), name="frontend")

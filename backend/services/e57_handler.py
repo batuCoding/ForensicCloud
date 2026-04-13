@@ -121,7 +121,18 @@ def _voxel_downsample(xyz: np.ndarray, rgb: np.ndarray, voxel_size: float):
 
     vox = np.floor(xyz / voxel_size).astype(np.int64)
 
-    # Build a structured array so np.unique can treat each row as a key
+    # CuPy doesn't support structured dtypes in cp.unique, so use lexsort instead
+    from services.gpu_utils import GPU_AVAILABLE, xp, to_gpu, to_cpu
+    if GPU_AVAILABLE and len(xyz) > 200_000:
+        vox_gpu = to_gpu(vox)
+        order   = xp.lexsort((vox_gpu[:, 2], vox_gpu[:, 1], vox_gpu[:, 0]))
+        vs      = vox_gpu[order]
+        diff    = xp.any(vs[1:] != vs[:-1], axis=1)
+        flags   = xp.concatenate([xp.array([True]), diff])
+        idx_cpu = to_cpu(order[flags])
+        return xyz[idx_cpu], rgb[idx_cpu]
+
+    # CPU path: structured-array np.unique (original)
     dt = np.dtype([("x", np.int64), ("y", np.int64), ("z", np.int64)])
     keys = np.empty(len(vox), dtype=dt)
     keys["x"] = vox[:, 0]

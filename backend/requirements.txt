@@ -7,3 +7,6 @@ numpy>=1.24.0
 scipy>=1.11.0
 reportlab>=4.0.0
 Pillow>=10.0.0
+scikit-learn>=1.3.0
+# GPU acceleration — uncomment if CUDA 12.x toolkit is installed:
+# cupy-cuda12x>=13.0.0

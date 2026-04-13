@@ -1,14 +1,31 @@
 """
-Noise removal algorithms — pure numpy + scipy, no open3d required.
+Noise removal algorithms — numpy + scipy with optional GPU/parallel acceleration.
 Every function returns a RemovalResult documenting exactly what was removed.
+
+Acceleration tiers (auto-selected at runtime):
+  GPU    : CuPy required (cupy-cuda12x) — 20-100x speedup for RANSAC/KDTree
+  CPU ‖  : scikit-learn n_jobs=-1 for KNN; ProcessPoolExecutor for RANSAC
+  Serial : scipy cKDTree fallback — original behaviour, always available
 """
 from __future__ import annotations
 
+import concurrent.futures
+import multiprocessing
 from dataclasses import dataclass
 from typing import Optional
 
 import numpy as np
 from scipy.spatial import cKDTree
+
+from services.gpu_utils import (
+    CPU_COUNT,
+    GPU_AVAILABLE,
+    SKLEARN_AVAILABLE,
+    free_gpu_bytes,
+    to_cpu,
+    to_gpu,
+    xp,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -49,11 +66,27 @@ def _apply_bbox_mask(xyz: np.ndarray, bbox_filter: Optional[dict]):
 
 
 # ---------------------------------------------------------------------------
-# Vectorised RGB → HSV (no external deps)
+# Vectorised RGB → HSV (GPU-accelerated for large arrays)
 # ---------------------------------------------------------------------------
 
 def _rgb_to_hsv(rgb: np.ndarray) -> np.ndarray:
     """(N,3) float32 0-1 → (N,3) where H∈[0,360], S/V∈[0,1]."""
+    if GPU_AVAILABLE and len(rgb) > 500_000:
+        g = to_gpu(rgb.astype(np.float32))
+        r_, g_, b_ = g[:, 0], g[:, 1], g[:, 2]
+        cmax  = xp.maximum(xp.maximum(r_, g_), b_)
+        cmin  = xp.minimum(xp.minimum(r_, g_), b_)
+        delta = cmax - cmin
+        h = xp.zeros(len(r_), dtype=xp.float32)
+        s = xp.where(cmax > 0, delta / (cmax + 1e-9), 0.0).astype(xp.float32)
+        v = cmax.astype(xp.float32)
+        m  = delta > 0
+        mr = m & (cmax == r_); mg = m & (cmax == g_); mb = m & (cmax == b_)
+        h[mr] = (60 * ((g_[mr] - b_[mr]) / (delta[mr] + 1e-9))) % 360
+        h[mg] = 60 * ((b_[mg] - r_[mg]) / (delta[mg] + 1e-9) + 2)
+        h[mb] = 60 * ((r_[mb] - g_[mb]) / (delta[mb] + 1e-9) + 4)
+        return to_cpu(xp.stack([h, s, v], axis=1))
+
     r, g, b = rgb[:, 0], rgb[:, 1], rgb[:, 2]
     cmax  = np.maximum(np.maximum(r, g), b)
     cmin  = np.minimum(np.minimum(r, g), b)
@@ -75,7 +108,53 @@ def _rgb_to_hsv(rgb: np.ndarray) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
-# 1. Statistical Outlier Removal  (scipy cKDTree)
+# KNN distances helper  (three-tier: GPU → sklearn → scipy)
+# ---------------------------------------------------------------------------
+
+def _knn_distances(wx: np.ndarray, k: int) -> np.ndarray:
+    """
+    Return squared Euclidean distances to k nearest neighbours, shape (N, k).
+    Column 0 is the point itself (distance ≈ 0) — callers must skip it.
+
+    Tier 1 — GPU brute-force (CuPy, fastest for N < 5 M)
+    Tier 2 — sklearn NearestNeighbors with n_jobs=-1 (multi-core CPU)
+    Tier 3 — scipy cKDTree (single-threaded fallback, always available)
+    """
+    N = len(wx)
+
+    # ── Tier 1: GPU ──────────────────────────────────────────────────────────
+    if GPU_AVAILABLE and N < 5_000_000:
+        pts  = to_gpu(wx.astype(np.float32))
+        free = free_gpu_bytes()
+        # each row of the distance matrix is N float32 = N*4 bytes
+        # diff(batch,N,3) + d2(batch,N) = 4 floats per cell; size both correctly
+        batch = max(1, min(512, int(free * 0.7 / (N * 4 * 4))))
+        out   = xp.empty((N, k), dtype=xp.float32)
+        for s in range(0, N, batch):
+            e    = min(s + batch, N)
+            diff = pts[s:e, None, :] - pts[None, :, :]
+            d2   = (diff * diff).sum(axis=2)
+            pi   = xp.argpartition(d2, kth=k - 1, axis=1)[:, :k]
+            pd   = xp.take_along_axis(d2, pi, axis=1)
+            so   = xp.argsort(pd, axis=1)
+            out[s:e] = xp.take_along_axis(pd, so, axis=1)
+        return to_cpu(out)
+
+    # ── Tier 2: sklearn multi-core ───────────────────────────────────────────
+    if SKLEARN_AVAILABLE:
+        from sklearn.neighbors import NearestNeighbors
+        nn = NearestNeighbors(n_neighbors=k, algorithm="ball_tree", n_jobs=-1)
+        nn.fit(wx)
+        dists, _ = nn.kneighbors(wx)
+        return (dists ** 2).astype(np.float32)
+
+    # ── Tier 3: scipy fallback ───────────────────────────────────────────────
+    dists, _ = cKDTree(wx).query(wx, k=k)
+    return (dists ** 2).astype(np.float32)
+
+
+# ---------------------------------------------------------------------------
+# 1. Statistical Outlier Removal
 # ---------------------------------------------------------------------------
 
 def statistical_outlier_removal(
@@ -87,16 +166,15 @@ def statistical_outlier_removal(
 ) -> RemovalResult:
     """Remove points whose mean kNN distance is > mean + std_ratio * std."""
     in_region, out_region = _apply_bbox_mask(xyz, bbox_filter)
-    wx, wr = xyz[in_region], rgb[in_region]
+    wx = xyz[in_region]
 
     if len(wx) < nb_neighbors + 2:
         return RemovalResult("Statistical Outlier Removal",
                              {"nb_neighbors": nb_neighbors, "std_ratio": std_ratio},
                              xyz, rgb, 0, _bbox(np.zeros((0, 3))), np.zeros((0, 3)))
 
-    tree  = cKDTree(wx)
-    dists, _ = tree.query(wx, k=nb_neighbors + 1)  # col 0 = self (dist 0)
-    mean_dists = dists[:, 1:].mean(axis=1)
+    dists_sq   = _knn_distances(wx, nb_neighbors + 1)
+    mean_dists = np.sqrt(dists_sq[:, 1:]).mean(axis=1)
 
     threshold  = mean_dists.mean() + std_ratio * mean_dists.std()
     keep_local = mean_dists <= threshold
@@ -119,7 +197,7 @@ def statistical_outlier_removal(
 
 
 # ---------------------------------------------------------------------------
-# 2. Radius Outlier Removal  (scipy cKDTree)
+# 2. Radius Outlier Removal
 # ---------------------------------------------------------------------------
 
 def radius_outlier_removal(
@@ -131,18 +209,16 @@ def radius_outlier_removal(
 ) -> RemovalResult:
     """Remove points that have fewer than nb_points neighbours within radius."""
     in_region, out_region = _apply_bbox_mask(xyz, bbox_filter)
-    wx, wr = xyz[in_region], rgb[in_region]
+    wx = xyz[in_region]
 
     if len(wx) == 0:
         return RemovalResult("Radius Outlier Removal",
                              {"nb_points": nb_points, "radius": radius},
                              xyz, rgb, 0, _bbox(np.zeros((0, 3))), np.zeros((0, 3)))
 
-    # Query the nb_points-th nearest neighbour distance.
-    # If that distance <= radius, the point has at least nb_points neighbours within radius.
     k = min(nb_points + 1, len(wx))
-    dists, _ = cKDTree(wx).query(wx, k=k)
-    keep_local = dists[:, -1] <= radius   # k-th neighbour within radius
+    dists_sq   = _knn_distances(wx, k)
+    keep_local = np.sqrt(dists_sq[:, -1]) <= radius      # k-th neighbour within radius
 
     removed_xyz = wx[~keep_local]
     region_idx  = np.where(in_region)[0]
@@ -162,7 +238,7 @@ def radius_outlier_removal(
 
 
 # ---------------------------------------------------------------------------
-# 3. Color Filter  (vectorised HSV, no deps)
+# 3. Color Filter  (vectorised HSV, GPU-accelerated for large arrays)
 # ---------------------------------------------------------------------------
 
 PRESETS: dict[str, list[list[float]]] = {
@@ -217,10 +293,158 @@ def color_filter_removal(
 
 
 # ---------------------------------------------------------------------------
-# 4. Plane RANSAC  (pure numpy — removes windows / glass walls)
+# 4. Plane RANSAC  (GPU-batched / CPU-parallel / serial)
 # ---------------------------------------------------------------------------
 
-def _fit_plane_ransac(
+# ── Module-level worker — must be top-level for Windows spawn pickling ──────
+
+def _ransac_worker(args: tuple) -> tuple:
+    """
+    ProcessPoolExecutor worker. Runs a subset of RANSAC iterations and returns
+    the best plane found as (normal_list, d_float, inlier_count).
+    Returns inlier COUNT (not indices) to minimise IPC data transfer.
+    The main process recomputes inlier indices from the winning normal.
+    """
+    import numpy as _np  # local import — each spawned process reimports
+    xyz_bytes, shape, dtype_str, dist_thresh, n_iters, seed = args
+    _np.random.seed(seed)
+    xyz = _np.frombuffer(xyz_bytes, dtype=_np.dtype(dtype_str)).reshape(shape)
+    n   = len(xyz)
+
+    best_count  = 0
+    best_normal = _np.array([0.0, 0.0, 1.0])
+    best_d      = 0.0
+
+    for _ in range(n_iters):
+        idx = _np.random.choice(n, 3, replace=False)
+        p0, p1, p2 = xyz[idx]
+        normal = _np.cross(p1 - p0, p2 - p0)
+        nl = _np.linalg.norm(normal)
+        if nl < 1e-9:
+            continue
+        normal /= nl
+        d     = -float(normal @ p0)
+        count = int((_np.abs(xyz @ normal + d) <= dist_thresh).sum())
+        if count > best_count:
+            best_count  = count
+            best_normal = normal.copy()
+            best_d      = d
+
+    return (best_normal.tolist(), best_d, best_count)
+
+
+# ── GPU RANSAC ───────────────────────────────────────────────────────────────
+
+def _fit_plane_ransac_gpu(
+    xyz: np.ndarray,
+    dist_thresh: float,
+    n_iters: int,
+) -> tuple[np.ndarray, float, np.ndarray]:
+    """
+    Batched GPU RANSAC.
+    Processes iterations in chunks sized to available VRAM so we never
+    materialise more than ~70 % of free memory at once.
+    """
+    N       = len(xyz)
+    xyz_gpu = to_gpu(xyz.astype(np.float32))
+
+    free  = free_gpu_bytes()
+    batch = max(1, min(50, int(free * 0.7 / (N * 4))))
+
+    best_count  = 0
+    best_normal = np.array([0.0, 0.0, 1.0])
+    best_d      = 0.0
+    best_mask_gpu = None   # boolean mask kept on GPU; transferred once after loop
+
+    i = 0
+    while i < n_iters:
+        cur = min(batch, n_iters - i)
+
+        idx       = np.random.randint(0, N, (cur, 3))
+        pts_batch = to_gpu(xyz[idx].astype(np.float32))   # (cur, 3, 3) — one transfer
+        p0, p1, p2 = pts_batch[:, 0, :], pts_batch[:, 1, :], pts_batch[:, 2, :]
+
+        normals = xp.cross(p1 - p0, p2 - p0)
+        nlen    = xp.linalg.norm(normals, axis=1, keepdims=True)
+        valid   = to_cpu(nlen[:, 0] > 1e-9)
+        normals = normals / (nlen + 1e-12)
+        d_vals  = -xp.sum(normals * p0, axis=1)
+
+        dist_mat   = xp.abs(xyz_gpu @ normals.T + d_vals[None, :])
+        counts_gpu = (dist_mat <= dist_thresh).sum(axis=0)
+        counts_cpu = to_cpu(counts_gpu)
+        counts_cpu[~valid] = 0
+
+        bi = int(np.argmax(counts_cpu))
+        if counts_cpu[bi] > best_count:
+            best_count    = counts_cpu[bi]
+            best_normal   = to_cpu(normals[bi])
+            best_d        = float(to_cpu(d_vals[bi]))
+            best_mask_gpu = dist_mat[:, bi] <= dist_thresh   # stay on GPU
+
+        i += cur
+
+    best_inliers = (
+        np.where(to_cpu(best_mask_gpu))[0]
+        if best_mask_gpu is not None
+        else np.array([], dtype=int)
+    )
+    return best_normal, best_d, best_inliers
+
+
+# ── CPU-parallel RANSAC ──────────────────────────────────────────────────────
+
+def _fit_plane_ransac_cpu_parallel(
+    xyz: np.ndarray,
+    dist_thresh: float,
+    n_iters: int,
+) -> tuple[np.ndarray, float, np.ndarray]:
+    """
+    Distribute RANSAC iterations across ProcessPoolExecutor workers (spawn).
+    Each worker runs a subset and returns its best plane.
+    Main process picks the global winner, then recomputes inlier indices.
+    """
+    n_workers  = min(CPU_COUNT, n_iters, 16)
+    base_iters = n_iters // n_workers
+    extra      = n_iters % n_workers
+
+    xyz_f32   = xyz.astype(np.float32)
+    raw       = xyz_f32.tobytes()          # serialise once for all workers
+    shape     = xyz_f32.shape
+    dtype_str = str(xyz_f32.dtype)
+
+    rng   = np.random.default_rng()
+    tasks = [
+        (raw, shape, dtype_str, dist_thresh,
+         base_iters + (1 if i < extra else 0),
+         int(rng.integers(0, 2 ** 31)))
+        for i in range(n_workers)
+    ]
+
+    ctx = multiprocessing.get_context("spawn")
+    with concurrent.futures.ProcessPoolExecutor(
+        max_workers=n_workers, mp_context=ctx
+    ) as pool:
+        futures = [pool.submit(_ransac_worker, t) for t in tasks]
+        results = [f.result() for f in futures]
+
+    best_count  = 0
+    best_normal = np.array([0.0, 0.0, 1.0])
+    best_d      = 0.0
+    for normal_list, d, cnt in results:
+        if cnt > best_count:
+            best_count  = cnt
+            best_normal = np.array(normal_list)
+            best_d      = d
+
+    # Recompute inliers from winning plane (cheap single-pass on CPU)
+    dists = np.abs(xyz @ best_normal + best_d)
+    return best_normal, best_d, np.where(dists <= dist_thresh)[0]
+
+
+# ── Serial RANSAC (original algorithm, always-available fallback) ────────────
+
+def _fit_plane_ransac_serial(
     xyz: np.ndarray,
     distance_threshold: float,
     num_iterations: int,
@@ -241,7 +465,7 @@ def _fit_plane_ransac(
         normal /= norm_len
         d = -float(normal @ p0)
 
-        dists = np.abs(xyz @ normal + d)
+        dists   = np.abs(xyz @ normal + d)
         inliers = np.where(dists <= distance_threshold)[0]
 
         if len(inliers) > len(best_inliers):
@@ -251,6 +475,24 @@ def _fit_plane_ransac(
 
     return best_normal, best_d, best_inliers
 
+
+# ── Dispatch: selects the best available implementation ──────────────────────
+
+def _fit_plane_ransac(
+    xyz: np.ndarray,
+    distance_threshold: float,
+    num_iterations: int,
+) -> tuple[np.ndarray, float, np.ndarray]:
+    """Route to GPU / CPU-parallel / serial based on available hardware."""
+    N = len(xyz)
+    if GPU_AVAILABLE:
+        return _fit_plane_ransac_gpu(xyz, distance_threshold, num_iterations)
+    if CPU_COUNT > 1 and N > 50_000:
+        return _fit_plane_ransac_cpu_parallel(xyz, distance_threshold, num_iterations)
+    return _fit_plane_ransac_serial(xyz, distance_threshold, num_iterations)
+
+
+# ── Public RANSAC removal function (unchanged API) ───────────────────────────
 
 def plane_ransac_removal(
     xyz: np.ndarray,
