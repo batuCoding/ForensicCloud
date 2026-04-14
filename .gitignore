@@ -1,3 +1,6 @@
 node_modules/
 dist/
 .venv/
+test_data/
+.playwright-mcp/
+*.png
