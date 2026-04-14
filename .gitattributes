@@ -1,0 +1,7 @@
+# Force LF line endings for all files that go into the Linux container.
+# Without this, Git on Windows checks out shell scripts with CRLF, which
+# breaks the shebang line and causes "no such file or directory" at runtime.
+* text=auto
+*.sh text eol=lf
+entrypoint.sh text eol=lf
+Dockerfile text eol=lf

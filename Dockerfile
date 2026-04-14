@@ -35,8 +35,10 @@ COPY backend/ ./backend/
 COPY --from=frontend-builder /build/dist ./frontend/dist/
 
 # Entrypoint: GPU probe + conditional cupy install + server launch
+# sed strips Windows CRLF line endings that survive if the repo was cloned
+# on Windows before .gitattributes enforced LF — harmless on Linux clones.
 COPY entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
+RUN sed -i 's/\r$//' /entrypoint.sh && chmod +x /entrypoint.sh
 
 # Defaults for Docker operation
 ENV HOST=0.0.0.0 \
