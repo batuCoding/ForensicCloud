@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import type { SessionStatus } from '../types'
 import { getDownloadUrl, startExport } from '../api/client'
 
@@ -15,14 +15,27 @@ const DOT: Record<string, string> = {
 }
 
 export default function StatusBar({ sessionId, status, processing }: Props) {
-  const [exporting, setExporting] = useState(false)
+  const [waitForDownload, setWaitForDownload] = useState(false)
+  const prevStatusRef = useRef<string>('')
 
-  const doExport = async () => {
-    setExporting(true)
+  // Detect exporting → ready transition to auto-trigger download
+  useEffect(() => {
+    const curr = status?.status ?? ''
+    const prev = prevStatusRef.current
+    prevStatusRef.current = curr
+    if (prev === 'exporting' && curr === 'ready' && waitForDownload) {
+      setWaitForDownload(false)
+      window.open(getDownloadUrl(sessionId))
+    }
+  }, [status?.status, sessionId, waitForDownload])
+
+  const doExportAndDownload = async () => {
+    setWaitForDownload(true)
     try { await startExport(sessionId) }
-    catch { /* error shown via status poll */ }
-    finally { setTimeout(() => setExporting(false), 3000) }
+    catch { setWaitForDownload(false) }
   }
+
+  const exporting = status?.status === 'exporting' || waitForDownload
 
   if (!status) {
     return <div className="h-7 bg-surface border-t border-border" />
@@ -69,28 +82,24 @@ export default function StatusBar({ sessionId, status, processing }: Props) {
         )}
 
         {phase === 'ready' && (
-          <div className="flex items-center gap-1.5">
-            <button onClick={doExport} disabled={exporting || processing}
-              className="flex items-center gap-1 text-muted hover:text-text disabled:opacity-40
-                transition-colors px-2 py-0.5 rounded border border-border hover:border-border2">
-              <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
-                  d="M8 7H5a2 2 0 00-2 2v9a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-3
-                     m-4-4v12m0 0l-3-3m3 3l3-3" />
-              </svg>
-              {exporting ? 'Exporting…' : 'Export E57'}
-            </button>
-
-            <a href={getDownloadUrl(sessionId)} download
-              className="flex items-center gap-1 bg-accent hover:bg-accent-hover text-white
-                transition-colors px-2.5 py-0.5 rounded font-medium">
-              <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
-                  d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
-              </svg>
-              Download
-            </a>
-          </div>
+          <button onClick={doExportAndDownload} disabled={exporting || processing}
+            className="flex items-center gap-1.5 bg-accent hover:bg-accent-hover text-white
+              disabled:opacity-40 disabled:cursor-not-allowed transition-colors px-2.5 py-0.5 rounded font-medium">
+            {exporting ? (
+              <>
+                <div className="w-3 h-3 border border-white/40 border-t-white rounded-full animate-spin" />
+                Exporting…
+              </>
+            ) : (
+              <>
+                <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
+                    d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
+                </svg>
+                Export & Download
+              </>
+            )}
+          </button>
         )}
       </div>
     </div>

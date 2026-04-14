@@ -229,7 +229,7 @@ async def auto_clean_endpoint(
         raise HTTPException(400, "Session is not yet ready.")
 
     background_tasks.add_task(
-        asyncio.get_event_loop().run_in_executor, None, _run_auto_clean, session_id, req
+        asyncio.get_running_loop().run_in_executor, None, _run_auto_clean, session_id, req
     )
     return {"started": True}
 
@@ -247,7 +247,7 @@ async def manual_clean_endpoint(
         raise HTTPException(400, "Session is not yet ready.")
 
     background_tasks.add_task(
-        asyncio.get_event_loop().run_in_executor, None, _run_manual_clean, session_id, req
+        asyncio.get_running_loop().run_in_executor, None, _run_manual_clean, session_id, req
     )
     return {"started": True}
 
@@ -265,7 +265,7 @@ async def region_delete_endpoint(
         raise HTTPException(400, "Session is not yet ready.")
 
     background_tasks.add_task(
-        asyncio.get_event_loop().run_in_executor, None, _run_region_delete, session_id, req
+        asyncio.get_running_loop().run_in_executor, None, _run_region_delete, session_id, req
     )
     return {"started": True}
 

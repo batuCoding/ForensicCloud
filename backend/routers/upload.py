@@ -92,7 +92,7 @@ async def upload_file(
 
     # Parse in background thread
     background_tasks.add_task(
-        asyncio.get_event_loop().run_in_executor,
+        asyncio.get_running_loop().run_in_executor,
         None,
         _parse_and_index,
         session.session_id,
