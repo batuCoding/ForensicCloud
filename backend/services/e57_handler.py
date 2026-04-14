@@ -125,7 +125,7 @@ def _voxel_downsample(xyz: np.ndarray, rgb: np.ndarray, voxel_size: float):
     from services.gpu_utils import GPU_AVAILABLE, xp, to_gpu, to_cpu
     if GPU_AVAILABLE and len(xyz) > 200_000:
         vox_gpu = to_gpu(vox)
-        order   = xp.lexsort((vox_gpu[:, 2], vox_gpu[:, 1], vox_gpu[:, 0]))
+        order   = xp.lexsort(xp.stack([vox_gpu[:, 2], vox_gpu[:, 1], vox_gpu[:, 0]]))
         vs      = vox_gpu[order]
         diff    = xp.any(vs[1:] != vs[:-1], axis=1)
         flags   = xp.concatenate([xp.array([True]), diff])
