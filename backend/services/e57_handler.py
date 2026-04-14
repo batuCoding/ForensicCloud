@@ -47,7 +47,7 @@ def read_e57(file_path: Path) -> dict:
     has_colors    = False
 
     for i in range(scan_count):
-        data = e57.read_scan(i, intensity=True, colors=True, row_column=False)
+        data = e57.read_scan(i, intensity=True, colors=True, row_column=False, ignore_missing_fields=True)
 
         x = np.asarray(data.get("cartesianX", []), dtype=np.float64)
         y = np.asarray(data.get("cartesianY", []), dtype=np.float64)
